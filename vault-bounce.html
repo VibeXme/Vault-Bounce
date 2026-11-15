@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vault Bounce</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060c;display:flex;align-items:center;justify-content:center;overflow:hidden;font-family:system-ui,-apple-system,sans-serif}
+  canvas{width:min(96vw,170vh);height:auto;aspect-ratio:16/9;background:#0c1024;border-radius:8px;box-shadow:0 0 60px #0008;touch-action:none;user-select:none}
+</style>
+</head>
+<body>
+<canvas id="c" width="960" height="540"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 960, H = 540, R = 14;
+
+// Tuning (mirrors the Unity scripts' values, scaled to pixels)
+const G = 1300, BOUNCE = 620, SUPER = 1.38, SLAMV = 900;
+const KICK = 280, KICKUP = 380, MOVE = 330, ACCEL = 2200, LAUNCH = 720;
+const FILL = 1.35, DRAIN = 0.6;
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+
+// Always-present boundary: floor, left wall, right wall, ceiling
+const BASE = [[0,515,960,25],[0,0,20,540],[940,0,20,540],[0,0,960,20]];
+const EXIT = [880, 430, 50, 85];
+
+const LEVELS = [
+  { // Level 1: floor bounce, platforms, spikes
+    solids: [[120,400,200,16],[380,300,180,16],[620,200,180,16]],
+    spikes: [[240,498,110,17],[600,498,100,17]],
+    keys:   [[200,360],[470,260],[710,160],[480,440],[860,440]],
+    spots: [], lasers: [], bumpers: [], drones: []
+  },
+  { // Level 2: sweeping security spotlights
+    solids: [[100,410,180,16],[330,330,160,16],[560,250,160,16],[740,380,140,16]],
+    spikes: [[240,498,110,17],[600,498,100,17]],
+    keys:   [[190,370],[410,290],[640,210],[810,340],[480,440]],
+    spots: [
+      {x:250,y:30,base:Math.PI/2,sweep:0.9,speed:1.3,range:460,half:0.35},
+      {x:700,y:30,base:Math.PI/2,sweep:-0.9,speed:1.7,range:460,half:0.35}
+    ],
+    lasers: [], bumpers: [], drones: []
+  },
+  { // Level 3: timed telegraph lasers in the shafts
+    solids: [[100,410,180,16],[330,330,160,16],[560,250,160,16],[740,380,140,16]],
+    spikes: [[240,498,110,17],[600,498,100,17]],
+    keys:   [[190,370],[410,290],[640,210],[810,340],[480,440]],
+    spots: [{x:250,y:30,base:Math.PI/2,sweep:0.9,speed:1.3,range:460,half:0.35}],
+    lasers: [
+      {x:520,y:300,w:8,h:215,on:1.6,off:1.6,warn:0.45,phase:0},
+      {x:690,y:270,w:8,h:245,on:1.6,off:1.6,warn:0.45,phase:0.8}
+    ],
+    bumpers: [], drones: []
+  },
+  { // Level 4: shock bumpers that launch you over spike pits
+    solids: [[100,410,180,16],[330,330,160,16],[560,250,160,16],[740,380,140,16]],
+    spikes: [[210,498,130,17],[560,498,120,17]],
+    keys:   [[190,370],[410,290],[640,210],[810,340],[480,440]],
+    spots: [{x:480,y:30,base:Math.PI/2,sweep:1.0,speed:1.5,range:460,half:0.32}],
+    lasers: [{x:520,y:300,w:8,h:215,on:1.6,off:1.6,warn:0.45,phase:0.4}],
+    bumpers: [[170,482,20],[660,482,20],[430,380,18]],
+    drones: []
+  },
+  { // Level 5: patrol drones guarding the corridors
+    solids: [[100,410,180,16],[330,330,160,16],[560,250,160,16],[740,380,140,16]],
+    spikes: [[240,498,110,17],[600,498,100,17]],
+    keys:   [[190,370],[410,290],[640,210],[810,340],[480,440]],
+    spots: [
+      {x:250,y:30,base:Math.PI/2,sweep:0.9,speed:1.3,range:460,half:0.35},
+      {x:700,y:30,base:Math.PI/2,sweep:-0.9,speed:1.7,range:460,half:0.35}
+    ],
+    lasers: [
+      {x:520,y:300,w:8,h:215,on:1.6,off:1.6,warn:0.45,phase:0},
+      {x:690,y:270,w:8,h:245,on:1.6,off:1.6,warn:0.45,phase:0.8}
+    ],
+    bumpers: [],
+    drones: [
+      {pts:[[120,250],[420,250]], pat:110, chase:185, aggro:150},
+      {pts:[[600,440],[860,440]], pat:120, chase:190, aggro:150}
+    ]
+  }
+];
+
+const keysDown = {};
+let L, li = 0, P, state = 'play', t = 0, det = 0, deadT = 0, msg = '';
+let touchDir = 0, slamReq = false, lastT = performance.now();
+
+function loadLevel(i) {
+  li = i;
+  const T = LEVELS[i];
+  L = {
+    solids: BASE.concat(T.solids),
+    spikes: T.spikes,
+    lasers: T.lasers.map(x => ({...x})),
+    bumpers: T.bumpers,
+    spots: T.spots,
+    drones: T.drones.map(d => ({...d, x: d.pts[0][0], y: d.pts[0][1], i: 0})),
+    keys: T.keys.map(k => ({x: k[0], y: k[1], got: false}))
+  };
+  P = {x: 60, y: 460, vx: 0, vy: 0, slam: false, sx: 1, sy: 1, sqT: 0};
+  det = 0;
+  msg = '';
+  state = 'play';
+}
+
+function restartGame() { loadLevel(0); }
+function resetLevel() { loadLevel(li); }
+
+function die(reason) {
+  if (state !== 'play') return;
+  state = 'dead';
+  deadT = 0.7;
+  msg = reason;
+}
+
+function nextLevel() {
+  if (li + 1 < LEVELS.length) loadLevel(li + 1);
+  else { state = 'win'; msg = ''; }
+}
+
+// Circle (player) vs axis-aligned rect [x,y,w,h]. Returns push-out info or null.
+function collideRect(px, py, r) {
+  const [rx, ry, rw, rh] = r;
+  const cx = clamp(px, rx, rx + rw), cy = clamp(py, ry, ry + rh);
+  const dx = px - cx, dy = py - cy, d2 = dx*dx + dy*dy;
+  if (d2 >= R*R) return null;
+  const d = Math.sqrt(d2);
+  if (d < 1e-6) return {nx: 0, ny: -1, d: R};
+  return {nx: dx/d, ny: dy/d, d: R - d};
+}
+
+function squash(sx, sy) { P.sx = sx; P.sy = sy; P.sqT = 0.1; }
+
+function laserState(l) {
+  const cyc = l.on + l.off;
+  const tt = (t + l.phase) % cyc;
+  if (tt < l.off - l.warn) return 0; // safe
+  if (tt < l.off) return 1;          // telegraph
+  return 2;                          // lethal
+}
+
+function spotAim(s) { return s.base + Math.sin(t * s.speed) * s.sweep; }
+function spotSees(s) {
+  const a = spotAim(s), dx = P.x - s.x, dy = P.y - s.y, d = Math.hypot(dx, dy);
+  if (d > s.range || d < 1) return false;
+  let df = Math.atan2(dy, dx) - a;
+  df = Math.atan2(Math.sin(df), Math.cos(df));
+  return Math.abs(df) < s.half;
+}
+
+function physics(h) {
+  if (state !== 'play') return;
+
+  const dir = clamp(
+    ((keysDown.ArrowRight || keysDown.KeyD) ? 1 : 0) -
+    ((keysDown.ArrowLeft || keysDown.KeyA) ? 1 : 0) + touchDir, -1, 1);
+
+  if (slamReq) {
+    slamReq = false;
+    if (!P.slam) { P.slam = true; P.vx *= 0.5; P.vy = SLAMV; }
+  }
+
+  P.vx += clamp(dir * MOVE - P.vx, -ACCEL*h, ACCEL*h);
+  P.vy += G * h;
+  P.x += P.vx * h;
+  P.y += P.vy * h;
+
+  for (const s of L.solids) {
+    const c = collideRect(P.x, P.y, s);
+    if (!c) continue;
+    P.x += c.nx * c.d; P.y += c.ny * c.d;
+    if (c.ny < -0.65) {                 // floor: bounce up
+      P.vy = -(P.slam ? BOUNCE * SUPER : BOUNCE);
+      P.slam = false; squash(1.45, 0.58);
+    } else if (Math.abs(c.nx) > 0.65) { // wall: ricochet off it
+      P.vx = c.nx * KICK;
+      P.vy = Math.min(P.vy, -KICKUP);
+      P.slam = false; squash(0.62, 1.38);
+    } else if (c.ny > 0.65) {           // ceiling: bonk down
+      P.vy = Math.max(P.vy, 60);
+      P.slam = false; squash(1.3, 0.7);
+    }
+  }
+
+  for (const s of L.spikes) if (collideRect(P.x, P.y, s)) { die('SPIKES'); return; }
+  for (const l of L.lasers) {
+    if (laserState(l) === 2 && collideRect(P.x, P.y, [l.x, l.y, l.w, l.h])) { die('LASER TRIPPED'); return; }
+  }
+
+  for (const b of L.bumpers) {
+    const dx = P.x - b[0], dy = P.y - b[1], d = Math.hypot(dx, dy), min = R + b[2];
+    if (d < min && d > 0.01) {
+      const nx = dx/d, ny = dy/d;
+      P.x += nx * (min - d); P.y += ny * (min - d);
+      P.vx = nx * LAUNCH; P.vy = ny * LAUNCH;
+      P.slam = false; squash(0.55, 1.5);
+    }
+  }
+}
+
+function updateDrones(dt) {
+  for (const d of L.drones) {
+    const chasing = dist(P.x, P.y, d.x, d.y) < d.aggro;
+    let tx, ty, sp;
+    if (chasing) { tx = P.x; ty = P.y; sp = d.chase; }
+    else { tx = d.pts[d.i][0]; ty = d.pts[d.i][1]; sp = d.pat; }
+    const dx = tx - d.x, dy = ty - d.y, dd = Math.hypot(dx, dy), st = sp * dt;
+    if (dd > st) { d.x += dx/dd*st; d.y += dy/dd*st; }
+    else if (!chasing) { d.x = tx; d.y = ty; d.i = (d.i + 1) % d.pts.length; }
+    if (dist(P.x, P.y, d.x, d.y) < R + 16) { die('CAUGHT BY A DRONE'); return; }
+  }
+}
+
+function updateSpots(dt) {
+  let watched = false;
+  for (const s of L.spots) if (spotSees(s)) watched = true;
+  if (watched) det += FILL * dt;
+  else det = Math.max(0, det - DRAIN * dt);
+  if (det >= 1) die('DETECTED BY SECURITY');
+}
+
+function updateKeysExit() {
+  for (const k of L.keys) if (!k.got && dist(P.x, P.y, k.x, k.y) < R + 14) k.got = true;
+  const got = L.keys.filter(k => k.got).length;
+  if (got >= L.keys.length && collideRect(P.x, P.y, EXIT)) nextLevel();
+}
+
+function updateSquash(dt) {
+  if (P.sqT > 0) { P.sqT -= dt; return; }
+  const st = clamp(Math.abs(P.vy) / SLAMV * 0.28, 0, 0.28);
+  const k = Math.min(1, dt * 16);
+  P.sx += ((1 - st*0.6) - P.sx) * k;
+  P.sy += ((1 + st) - P.sy) * k;
+}
+
+function update(dt) {
+  t += dt;
+  if (state === 'dead') {
+    deadT -= dt;
+    if (deadT <= 0) resetLevel();
+    return;
+  }
+  if (state !== 'play') return;
+  const sub = 4, h = dt / sub;
+  for (let s = 0; s < sub; s++) physics(h);
+  if (state !== 'play') return;
+  updateDrones(dt);
+  if (state !== 'play') return;
+  updateSpots(dt);
+  if (state !== 'play') return;
+  updateKeysExit();
+  updateSquash(dt);
+}
+
+// ---------- drawing ----------
+function drawRect(r, fill, top) {
+  ctx.fillStyle = fill;
+  ctx.fillRect(r[0], r[1], r[2], r[3]);
+  if (top) { ctx.fillStyle = top; ctx.fillRect(r[0], r[1], r[2], 3); }
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0c1024'); bg.addColorStop(1, '#060812');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = 'rgba(120,140,255,0.06)'; ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 48) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 48) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  // Spotlight cones
+  for (const s of L.spots) {
+    const a = spotAim(s), watching = spotSees(s);
+    ctx.fillStyle = watching ? 'rgba(255,80,100,0.28)' : 'rgba(255,220,90,0.16)';
+    ctx.beginPath();
+    ctx.moveTo(s.x, s.y);
+    ctx.lineTo(s.x + Math.cos(a - s.half) * s.range, s.y + Math.sin(a - s.half) * s.range);
+    ctx.lineTo(s.x + Math.cos(a + s.half) * s.range, s.y + Math.sin(a + s.half) * s.range);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#ffd25a';
+    ctx.beginPath(); ctx.arc(s.x, s.y, 6, 0, Math.PI*2); ctx.fill();
+  }
+
+  // Solids
+  for (const s of L.solids) drawRect(s, '#1d2446', '#4c5fd6');
+
+  // Spikes
+  for (const s of L.spikes) {
+    ctx.fillStyle = '#ff4d6d';
+    const n = Math.max(1, Math.floor(s[2] / 12));
+    const tw = s[2] / n;
+    for (let i = 0; i < n; i++) {
+      const x0 = s[0] + i * tw;
+      ctx.beginPath();
+      ctx.moveTo(x0, s[1] + s[3]);
+      ctx.lineTo(x0 + tw/2, s[1]);
+      ctx.lineTo(x0 + tw, s[1] + s[3]);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  // Lasers
+  for (const l of L.lasers) {
+    const st = laserState(l);
+    if (st === 0) { ctx.fillStyle = 'rgba(255,60,90,0.12)'; }
+    else if (st === 1) { ctx.fillStyle = `rgba(255,60,90,${0.25 + 0.25*Math.abs(Math.sin(t*20))})`; }
+    else { ctx.fillStyle = '#ff2a4d'; ctx.shadowColor = '#ff2a4d'; ctx.shadowBlur = 14; }
+    ctx.fillRect(l.x, l.y, l.w, l.h);
+    ctx.shadowBlur = 0;
+  }
+
+  // Bumpers
+  for (const b of L.bumpers) {
+    ctx.shadowColor = '#ffd166'; ctx.shadowBlur = 16;
+    ctx.fillStyle = '#ffd166';
+    ctx.beginPath(); ctx.arc(b[0], b[1], b[2], 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = '#fff3c4'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(b[0], b[1], b[2]*0.55, 0, Math.PI*2); ctx.stroke();
+  }
+
+  // Exit door
+  const unlocked = L.keys.every(k => k.got);
+  ctx.fillStyle = unlocked ? '#3ddc84' : '#d64545';
+  ctx.fillRect(EXIT[0], EXIT[1], EXIT[2], EXIT[3]);
+  ctx.fillStyle = '#0a0d18';
+  ctx.fillRect(EXIT[0]+8, EXIT[1]+8, EXIT[2]-16, EXIT[3]-16);
+
+  // Keys
+  for (const k of L.keys) {
+    if (k.got) continue;
+    const y = k.y + Math.sin(t * 3.5) * 3;
+    ctx.shadowColor = '#ffd24a'; ctx.shadowBlur = 12;
+    ctx.fillStyle = '#ffd24a';
+    ctx.beginPath(); ctx.arc(k.x, y, 9, 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#0c1024';
+    ctx.beginPath(); ctx.arc(k.x, y, 3.5, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#ffd24a';
+    ctx.fillRect(k.x + 7, y - 2, 10, 4);
+  }
+
+  // Drones
+  for (const d of L.drones) {
+    ctx.fillStyle = '#ff8a5b';
+    ctx.fillRect(d.x - 13, d.y - 13, 26, 26);
+    ctx.fillStyle = '#0c1024';
+    ctx.beginPath(); ctx.arc(d.x, d.y, 4, 0, Math.PI*2); ctx.fill();
+  }
+
+  // Player (hidden while dead)
+  if (state !== 'dead') {
+    ctx.save();
+    ctx.translate(P.x, P.y);
+    ctx.scale(P.sx, P.sy);
+    ctx.shadowColor = '#ff6fc0'; ctx.shadowBlur = 18;
+    const pg = ctx.createRadialGradient(-4, -4, 2, 0, 0, R);
+    pg.addColorStop(0, '#ffd1ef'); pg.addColorStop(1, '#c2407e');
+    ctx.fillStyle = pg;
+    ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // HUD
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 20px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  const got = L.keys.filter(k => k.got).length;
+  ctx.fillText(`KEYS: ${got} / ${L.keys.length}`, 32, 30);
+
+  ctx.textAlign = 'center';
+  ctx.fillText(`LEVEL ${li + 1}`, W/2, 30);
+
+  ctx.textAlign = 'right';
+  ctx.font = 'bold 14px system-ui, sans-serif';
+  ctx.fillStyle = '#c9cfee';
+  ctx.fillText('DETECTION', W - 32, 24);
+  const bx = W - 232, by = 46, bw = 200, bh = 12;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fillRect(bx, by, bw, bh);
+  const dg = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+  dg.addColorStop(0, '#ffb347'); dg.addColorStop(1, '#ff3b5c');
+  ctx.fillStyle = dg;
+  ctx.fillRect(bx, by, bw * clamp(det, 0, 1), bh);
+
+  // Hint
+  ctx.textAlign = 'center';
+  ctx.font = '13px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(200,210,255,0.5)';
+  ctx.fillText('← → / A D move   ·   S / ↓ / Space slam   ·   R restart', W/2, H - 22);
+
+  // Overlays
+  if (state === 'dead') {
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 40px system-ui, sans-serif';
+    ctx.fillStyle = '#ff5c7a';
+    ctx.fillText(msg, W/2, H/2);
+  }
+  if (state === 'win') {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 48px system-ui, sans-serif';
+    ctx.fillStyle = '#3ddc84';
+    ctx.fillText('VAULT CLEARED', W/2, H/2 - 20);
+    ctx.font = '20px system-ui, sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('Press R or tap to play again', W/2, H/2 + 30);
+  }
+}
+
+// ---------- input ----------
+addEventListener('keydown', e => {
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  if (e.repeat) return;
+  keysDown[e.code] = true;
+  if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'Space') slamReq = true;
+  if (e.code === 'KeyR' || (state === 'win' && e.code === 'Space')) restartGame();
+});
+addEventListener('keyup', e => { keysDown[e.code] = false; });
+
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (state === 'win') { restartGame(); return; }
+  const r = cv.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width;
+  if (x < 0.33) touchDir = -1;
+  else if (x > 0.67) touchDir = 1;
+  else slamReq = true;
+});
+const release = () => { touchDir = 0; };
+addEventListener('pointerup', release);
+addEventListener('pointercancel', release);
+
+// ---------- loop ----------
+function frame(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+loadLevel(0);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
